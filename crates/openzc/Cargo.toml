@@ -1,0 +1,39 @@
+[package]
+name = "openzc"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "OpenZ Compressor engine: modular, lossless, streamable compression"
+
+[dependencies]
+# Engine internals. Declared here (not in the workspace) so the CLI and the
+# benchmark harness cannot accidentally couple themselves to them.
+blake3 = { version = "1.8.7", default-features = false, optional = true }
+rayon = { version = "1.12", optional = true }
+# Range coder and exactly-invertible fixed-point probability models.
+#
+# This is a deliberate dependency: the entropy stage is the one place where a
+# subtle fixed-point or normalisation bug produces a stream that decodes to
+# *plausible but wrong* bytes. `constriction` is a research-grade
+# implementation whose models are constructed to be exactly invertible, and it
+# is used as a proven primitive. Everything above it — the format, the LZ stage,
+# the context model, the pipeline selection — is OpenZC's own.
+constriction = "0.5"
+
+[features]
+default = ["parallel", "checksum"]
+# Parallel chunk compression/decompression via Rayon.
+parallel = ["dep:rayon"]
+# BLAKE3 content integrity. Without it, only structural checks are performed.
+checksum = ["dep:blake3"]
+
+[lib]
+name = "openzc"
+path = "src/lib.rs"
+
+[[bench]]
+name = "throughput"
+harness = false

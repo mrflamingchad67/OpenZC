@@ -1,0 +1,49 @@
+[workspace]
+resolver = "2"
+members = ["crates/openzc", "crates/openzc-cli", "crates/openzc-bench"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+# Minimum supported Rust version.
+#
+# This is driven by the dependency graph, not by our own code: blake3 1.8 is an
+# edition-2024 crate (needs 1.85) and rayon 1.12 declares rust-version 1.80.
+# Declaring a lower MSRV than the dependencies honour would make `cargo build`
+# fail confusingly on an older toolchain, so it is set to the real floor.
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/openzc/openzc"
+authors = ["OpenZC contributors"]
+description = "OpenZ Compressor - a modular, lossless, streamable compression engine"
+
+[workspace.dependencies]
+# Shared by every member that consumes the engine. blake3 and rayon are
+# deliberately *not* here: they are implementation details of the openzc crate
+# and no other member should be able to depend on them directly.
+openzc = { path = "crates/openzc", version = "0.1.0" }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+# NOTE: `panic = "abort"` is deliberately NOT set. The decoder is written to
+# return errors on malformed input rather than panic, and the test suite relies
+# on catching panics from a deliberately corrupted-input harness. Aborting would
+# also prevent `catch_unwind` in the fuzzing targets. Size is not a primary
+# goal for this engine, so the trade is not worth making.
+debug = false
+
+# Test profile keeps unwinding even in release, so corruption tests behave the
+# same way in `cargo test` and `cargo test --release`.
+[profile.test]
+opt-level = 2
+debug = true
+
+# Benchmark profile: keep optimizations on, but allow faster incremental builds
+# and keep debug info for profiling.
+[profile.bench]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+debug = true

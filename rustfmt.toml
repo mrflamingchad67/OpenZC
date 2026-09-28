@@ -1,0 +1,9 @@
+# OpenZC formatting policy.
+#
+# `max_width = 100` is rustfmt's default and is kept explicit so that the
+# quality gate (`cargo fmt --check`) is reproducible regardless of any
+# user-level rustfmt.toml on the machine.
+max_width = 100
+use_small_heuristics = "Default"
+newline_style = "Unix"
+edition = "2021"

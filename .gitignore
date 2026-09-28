@@ -1,0 +1,36 @@
+# Build output. This is ~1 GB of artefacts and nothing here belongs in history.
+/target
+**/target/
+
+# Compressed output from manual CLI runs. A stray .ozc in the repository is
+# always an accident, never a fixture — the test-suite builds its own inputs.
+/*.ozc
+*.ozc.out
+
+# Benchmark and profiling artefacts.
+/criterion
+*.svg
+*.profraw
+*.flamegraph.svg
+/benches/results
+
+# Fuzzing corpora and crash artefacts. The seed corpus is worth keeping in
+# review, but libFuzzer's generated corpus and any crash files are not.
+/fuzz/corpus
+/fuzz/artifacts
+/fuzz/target
+
+# Editor and OS cruft.
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+*.iml
+
+# Local overrides. Cargo handles most of this, but a private registry or a
+# patched path dependency must never be committed by accident.
+.cargo/config.toml
+.cargo/config

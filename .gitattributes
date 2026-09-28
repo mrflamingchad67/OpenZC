@@ -1,0 +1,9 @@
+# Normalise line endings in the repository, and check out LF on every platform.
+# Without this, a Windows checkout and a Linux checkout disagree on every line,
+# which shows up as whole-file diffs rather than as the one line that changed.
+* text=auto eol=lf
+
+# Binary-ish files that must never be line-ending translated.
+*.png binary
+*.jpg binary
+*.ico binary

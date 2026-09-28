@@ -1,0 +1,16 @@
+[package]
+name = "openzc-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Command line front-end for the OpenZC compression engine"
+
+[[bin]]
+name = "openzc"
+path = "src/main.rs"
+
+[dependencies]
+openzc = { workspace = true }
