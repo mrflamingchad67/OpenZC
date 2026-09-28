@@ -90,11 +90,35 @@ jobs:
       - name: Smoke-test the CLI round trip
         run: |
           set -euo pipefail
+          # Generated without a pipe: `yes ... | head` dies of SIGPIPE, which
+          # `pipefail` correctly reports as a failure, so it cannot be used here.
+          for _ in $(seq 1 2500); do
+            echo "the quick brown fox jumps over the lazy dog"
+          done > /tmp/text.bin
           head -c 200000 /dev/urandom > /tmp/incompressible.bin
+
+          # Incompressible input must be stored, and must still round trip.
           ./target/release/openzc test /tmp/incompressible.bin
-          # A known-compressible input must actually get smaller, and the
-          # decompressed bytes must match the original exactly.
-          yes "the quick brown fox jumps over the lazy dog" | head -c 100000 > /tmp/text.bin
+
+          # Compressible input must actually get smaller.
           ./target/release/openzc compress -f /tmp/text.bin
-          ./target/release/openzc decompress -f /tmp/text.bin.ozc
-          cmp /tmp/text.bin /tmp/text.bin && echo "round trip identical"
+          original=$(stat -c%s /tmp/text.bin)
+          packed=$(stat -c%s /tmp/text.bin.ozc)
+          echo "text: ${original} -> ${packed} bytes"
+          test "$packed" -lt "$original"
+
+          # Decompress to a *different* path. Comparing the original against
+          # itself would pass no matter what the codec did, which is exactly the
+          # check that must not be allowed to be vacuous.
+          ./target/release/openzc decompress -f -o /tmp/restored.bin /tmp/text.bin.ozc
+          cmp /tmp/text.bin /tmp/restored.bin
+          echo "round trip byte-identical"
+
+          # And a corrupted stream must be rejected, not decoded into garbage.
+          cp /tmp/text.bin.ozc /tmp/damaged.ozc
+          printf '\xde\xad\xbe\xef' | dd of=/tmp/damaged.ozc bs=1 seek=40 conv=notrunc status=none
+          if ./target/release/openzc decompress -f -o /tmp/should_not_exist.bin /tmp/damaged.ozc; then
+            echo "error: a corrupted stream decoded successfully"
+            exit 1
+          fi
+          echo "corrupted stream correctly rejected"
