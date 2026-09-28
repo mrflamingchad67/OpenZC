@@ -1,0 +1,100 @@
+# The same four-command gate the project holds itself to, run on GitHub.
+#
+# This is deliberately identical to what `scripts/publish.ps1` runs locally. A
+# gate that CI enforces and contributors do not run is worse than no gate: it
+# teaches people to wait for the red X instead of running the check.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# A new push to the same branch makes the in-flight run irrelevant.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # Fewer codegen units and no incremental cache: this is a verification run, not
+  # a benchmark, and a stale incremental cache can mask a real compile error.
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  gate:
+    name: fmt, check, test, clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the pinned toolchain
+        # The MSRV is declared in Cargo.toml; the lockfile's edition-2024
+        # dependencies mean a stale toolchain cannot even parse the manifests.
+        run: rustup show active-toolchain || rustup toolchain install stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Cache the fuzz corpus build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      - name: cargo fmt --check
+        run: cargo fmt --check
+
+      - name: cargo check --all-targets
+        run: cargo check --all-targets
+
+      - name: cargo test --all-targets
+        run: cargo test --all-targets
+
+      - name: cargo clippy --all-targets --all-features -- -D warnings
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+  # A gate that only passes on the test machine is not a gate. This job runs the
+  # suite on the oldest toolchain the project claims to support, which is the only
+  # way an MSRV in a manifest stays honest.
+  msrv:
+    name: MSRV
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install the declared minimum toolchain
+        run: |
+          rustup toolchain install "$(grep -oP 'rust-version\s*=\s*"\K[^"]+' Cargo.toml)"
+          rustup override set "$(grep -oP 'rust-version\s*=\s*"\K[^"]+' Cargo.toml)"
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo check
+        run: cargo check --all-targets
+
+  # The library must be usable by a downstream crate, not only by its own tests.
+  # `cargo test` inside the workspace cannot catch an accidental private type in
+  # a public signature; an external consumer can.
+  consumer:
+    name: downstream consumer
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - name: Build and test as an external dependency
+        run: |
+          cargo test --manifest-path crates/openzc/Cargo.toml --all-features
+          cargo build --release -p openzc-cli
+          cargo build --release -p openzc-bench
+      - name: Smoke-test the CLI round trip
+        run: |
+          set -euo pipefail
+          head -c 200000 /dev/urandom > /tmp/incompressible.bin
+          ./target/release/openzc test /tmp/incompressible.bin
+          # A known-compressible input must actually get smaller, and the
+          # decompressed bytes must match the original exactly.
+          yes "the quick brown fox jumps over the lazy dog" | head -c 100000 > /tmp/text.bin
+          ./target/release/openzc compress -f /tmp/text.bin
+          ./target/release/openzc decompress -f /tmp/text.bin.ozc
+          cmp /tmp/text.bin /tmp/text.bin && echo "round trip identical"

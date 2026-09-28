@@ -13,7 +13,7 @@ edition = "2021"
 # fail confusingly on an older toolchain, so it is set to the real floor.
 rust-version = "1.85"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/openzc/openzc"
+repository = "https://github.com/mrflamingchad67/OpenZC"
 authors = ["OpenZC contributors"]
 description = "OpenZ Compressor - a modular, lossless, streamable compression engine"
 
