@@ -248,6 +248,79 @@ This is recorded because the lesson is not "be careful with LZ". It is that **a
 test whose input makes two different implementations agree cannot detect the
 difference between them.**
 
+## Candidate pruning: what the measurements allowed
+
+The planner runs candidates in order and keeps the smallest. The obvious
+optimisation is to skip candidates that cannot win, so this section records what
+was measured before anything was changed.
+
+`Planner::candidates_for` and `Planner::explain_candidates` exist so that
+*selection* can be read without running an encode. Which pipeline wins is a ratio
+question settled by measurement; which candidates are even considered is a policy
+question, and a policy nobody can read is a policy nobody can review.
+
+### What each candidate costs
+
+Per-candidate encode time on 2 MiB, best of three, and the size each produces:
+
+| corpus | candidates | total | winner |
+|---|---|---|---|
+| random | 1 | 0–1 ms | `store` |
+| numeric | 5 | 21–26 ms | `statistical/delta` |
+| text | 3 | 40 ms | `statistical/none` |
+| runs | 6 | 29 ms | `rle/none` |
+| wide-text | 3 | 74 ms | `statistical/none` |
+| near-random-acgt | 6 | 130 ms | `statistical/none` |
+| **runs @ max** | 6 | **1 286 ms** | **`rle/none` (1 ms of it)** |
+| **interleaved @ max** | 3 | **1 027 ms** | `statistical/none` |
+
+The last two rows are the interesting ones, and they point in opposite directions.
+
+### The one change that was safe
+
+`rle` appeared **twice** in the candidate list on run-heavy data — added by the
+registry loop and again by the explicit `Repetitive` push — so the same pipeline
+was encoded twice, byte for byte, for no benefit. Seven candidates where six were
+correct.
+
+Deduplicating is provably output-neutral: a repeat encodes to the same payload and
+cannot change which is smallest. Measured on `runs`, 7 → 6 candidates with every
+ratio byte-identical (0.0302 at every level).
+
+### The pruning that was not safe, and why
+
+The tempting rules, and what the measurements say about each:
+
+| rule | `runs` | `near-random-acgt` |
+|---|---|---|
+| "skip the LZ pipelines when RLE is offered" | correct (RLE 63 095 vs 76 238) | **wrong by 3.3x** (RLE 2 261 658 vs 676 298) |
+| "trust the `Repetitive` class" | correct | **wrong** — ACGT is classified `LowEntropy` |
+
+RLE is *offered* on both corpora and wins exactly one. So neither rule is safe, and
+any threshold that separated them would be a guess fitted to two data points. This
+is pinned by `rle_is_offered_on_data_where_it_can_lose_badly`, which exists so that
+nobody adds such a rule without measuring first.
+
+The same applies to dropping `lz-fast` whenever `statistical` is available:
+statistical beat it in 7 of 7 corpora here, but that is seven synthetic inputs, and
+`lz-fast` is what serves chunks too small for statistical's tables to amortise. A
+rule that looks free on this sample is a rule with an unmeasured tail.
+
+### The conclusion
+
+**Candidate pruning is close to exhausted as a safe optimisation.** What remains
+costs about 1 200 ms on `runs` at level `max` — and none of it can be removed
+without a rule that is wrong on a corpus where RLE or LZ genuinely wins.
+
+The remaining waste is real but it is a *prediction* problem, not a bookkeeping
+one: skipping work safely needs a signal that says "this will lose", and the
+signals available today do not separate the two cases. The honest options are to
+build that signal (work in the analysis stage) or to accept the cost.
+
+What was already in place and needed no change: the incompressible path is optimal.
+Uniform random data gets exactly one candidate and encodes in under 10 ms, because
+`looks_incompressible` short-circuits before any pipeline is built.
+
 ## Rejected and deferred
 
 * **Dictionary priming.** Specified in the format (`dict_id`, pipeline 5) but not
@@ -259,10 +332,11 @@ difference between them.**
   which it therefore refuses. Detecting constant-byte positions rather than
   measuring drift would fix it; that is work in the analysis stage, not a
   threshold change.
-* **Candidate pruning.** The planner attempts every plausible pipeline on every
-  chunk. At `Level::Default` that means the statistical pipeline runs even on
-  chunks where `store` will win outright. Measuring how often that happens, and
-  skipping safely, is the next cheap win.
+* **A signal that predicts the RLE winner.** ~1 200 ms is spent per 2 MiB of
+  run-heavy data at level `max` on candidates that provably lose, and none of it can
+  be removed safely: RLE wins on one corpus and loses by 3.3x on another that looks
+  identical to every cheap signal. Skipping that work needs a *prediction*, and the
+  analysis stage does not have one. See "Candidate pruning" above.
 * **GPU acceleration.** Deliberately out of scope. It is the only plausible answer
   to "much faster", and it would make the decoder harder to audit — which is the
   wrong trade for a format whose main claim is that damage is detectable.

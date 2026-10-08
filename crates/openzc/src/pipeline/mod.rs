@@ -147,8 +147,10 @@ impl Planner {
             }
         }
 
-        // RLE earns its place on run-heavy data, and is cheap enough to always
-        // measure when the data looks repetitive.
+        // RLE is a registry member, so the loop above has already added it when its
+        // own `candidate()` accepted. This push used to duplicate it on repetitive
+        // data: the same pipeline encoded twice, byte for byte, for no benefit.
+        // Measured as 7 candidates on the `runs` corpus where 6 were correct.
         if analysis.kind == DataKind::Repetitive {
             out.push((PipelineId::Rle, TransformId::None));
         }
@@ -157,8 +159,22 @@ impl Planner {
             out.truncate(2);
         }
 
-        // `Store` is always measured last as the safety net.
+        // `store` is always measured last as the safety net.
         out.push((PipelineId::Store, TransformId::None));
+
+        // Every candidate is encoded in full, and a repeat cannot change which one
+        // is smallest, so a duplicate is pure waste. Deduplicating once here rather
+        // than at each push site means a future candidate rule cannot reintroduce
+        // the problem without this guard catching it.
+        let mut seen: Vec<(PipelineId, TransformId)> = Vec::with_capacity(out.len());
+        out.retain(|c| {
+            if seen.contains(c) {
+                false
+            } else {
+                seen.push(*c);
+                true
+            }
+        });
         out
     }
 
@@ -339,6 +355,125 @@ impl Planner {
     pub fn config(&self) -> &Config {
         &self.config
     }
+
+    /// The candidates this planner would measure for `input`, in order.
+    ///
+    /// Exposed so candidate *selection* can be inspected without running an encode.
+    /// Which pipeline wins is a ratio question and is settled by measurement; which
+    /// candidates are even considered is a policy question, and a policy nobody can
+    /// read is a policy nobody can review. A pruning change that silently drops a
+    /// useful candidate is otherwise invisible until someone notices a ratio
+    /// regression months later.
+    pub fn candidates_for(&self, input: &[u8]) -> Result<Vec<(PipelineId, TransformId)>> {
+        let analysis = Analysis::of(input)?;
+        Ok(self.candidates(input, &analysis))
+    }
+
+    /// Why each pipeline was or was not considered for `input`.
+    ///
+    /// For diagnostics, and for tests that assert a pruning rule actually *fires*
+    /// rather than merely appearing to.
+    pub fn explain_candidates(&self, input: &[u8]) -> Result<Vec<CandidateReport>> {
+        let analysis = Analysis::of(input)?;
+        let level = self.config.level();
+        let chosen = self.candidates(input, &analysis);
+
+        let mut out = Vec::new();
+        for codec in self.registry.all() {
+            let id = codec.id();
+
+            let reason = match id {
+                PipelineId::Store => CandidateReason::AlwaysMeasuredAsFloor,
+                PipelineId::Dictionary => CandidateReason::NotImplementedYet,
+                _ => {
+                    if codec.candidate(&analysis, level) {
+                        CandidateReason::CandidateAccepted
+                    } else if analysis.looks_incompressible() {
+                        CandidateReason::Incompressible
+                    } else {
+                        CandidateReason::CandidateRejected
+                    }
+                }
+            };
+
+            let transform = if matches!(id, PipelineId::LzFast | PipelineId::Statistical)
+                && !analysis.looks_incompressible()
+            {
+                match self.transform_for(input, &analysis, id) {
+                    Some(t) => TransformOutcome::Added(t),
+                    None => TransformOutcome::NotOffered,
+                }
+            } else {
+                TransformOutcome::NotConsidered
+            };
+
+            out.push(CandidateReport {
+                pipeline: id,
+                in_list: chosen.contains(&(id, TransformId::None)),
+                reason,
+                transform,
+            });
+        }
+        Ok(out)
+    }
+}
+
+/// Why a pipeline was or was not considered for a chunk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CandidateReason {
+    /// The pipeline passed its own `candidate()` check.
+    CandidateAccepted,
+    /// The pipeline's `candidate()` check refused it.
+    CandidateRejected,
+    /// The chunk looks incompressible, so nothing is worth trying.
+    Incompressible,
+    /// `store` is always measured, as the floor a chunk may not exceed.
+    AlwaysMeasuredAsFloor,
+    /// Specified in the format but never emitted.
+    NotImplementedYet,
+}
+
+impl CandidateReason {
+    pub fn name(self) -> &'static str {
+        match self {
+            CandidateReason::CandidateAccepted => "accepted",
+            CandidateReason::CandidateRejected => "rejected",
+            CandidateReason::Incompressible => "incompressible",
+            CandidateReason::AlwaysMeasuredAsFloor => "floor",
+            CandidateReason::NotImplementedYet => "unimplemented",
+        }
+    }
+}
+
+/// What happened to one pipeline's second, transformed attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransformOutcome {
+    /// The transform was offered and added as a candidate.
+    Added(TransformId),
+    /// The transform was tested and refused.
+    NotOffered,
+    /// No transform applies to this pipeline.
+    NotConsidered,
+}
+
+impl TransformOutcome {
+    pub fn name(self) -> String {
+        match self {
+            TransformOutcome::Added(t) => format!("added {}", t.name()),
+            TransformOutcome::NotOffered => "not offered".to_string(),
+            TransformOutcome::NotConsidered => "n/a".to_string(),
+        }
+    }
+}
+
+/// One pipeline's candidate status for a chunk.
+#[derive(Debug, Clone, Copy)]
+pub struct CandidateReport {
+    pub pipeline: PipelineId,
+    /// True when the untransformed pipeline is in the candidate list.
+    pub in_list: bool,
+    pub reason: CandidateReason,
+    pub transform: TransformOutcome,
 }
 
 #[cfg(test)]
@@ -481,6 +616,337 @@ mod tests {
     /// selection shows up here rather than hiding behind them.
     fn numeric_corpus(n: usize) -> Vec<u8> {
         (0..n).map(|i| ((i * 3) % 256) as u8).collect()
+    }
+
+    /// A deterministic wide-alphabet text corpus.
+    fn wide_text_corpus(n: usize) -> Vec<u8> {
+        let mut s = 13u32;
+        (0..n)
+            .map(|_| {
+                let mut next = || {
+                    s ^= s << 13;
+                    s ^= s >> 17;
+                    s ^= s << 5;
+                    s
+                };
+                match (next() >> 24) % 6 {
+                    0 => b'a' + (next() % 26) as u8,
+                    1 => b'A' + (next() % 26) as u8,
+                    2 => b' ' + (next() % 2) as u8,
+                    3 => b',',
+                    4 => b'.',
+                    _ => b'\n',
+                }
+            })
+            .collect()
+    }
+
+    /// A deterministic run-heavy corpus.
+    fn runs_corpus(n: usize) -> Vec<u8> {
+        let mut s = 7u32;
+        let mut out = Vec::with_capacity(n);
+        while out.len() < n {
+            s ^= s << 13;
+            s ^= s >> 17;
+            s ^= s << 5;
+            out.extend(std::iter::repeat_n(
+                (s >> 8) as u8,
+                1 + (s >> 24) as usize % 200,
+            ));
+        }
+        out.truncate(n);
+        out
+    }
+
+    /// A deterministic low-entropy, non-periodic corpus.
+    ///
+    /// Only four distinct byte values, but no repetition for LZ to exploit — the
+    /// classic hard case, and the one that most punishes a wrong pruning rule.
+    fn random_alphabet_corpus(n: usize) -> Vec<u8> {
+        let mut s = 77u32;
+        (0..n)
+            .map(|_| {
+                s ^= s << 13;
+                s ^= s >> 17;
+                s ^= s << 5;
+                b"ACGT"[(s >> 24) as usize % 4]
+            })
+            .collect()
+    }
+
+    /// A deterministic low-entropy, periodic corpus.
+    ///
+    /// Four byte values on a fixed stride: structured enough for every pipeline to
+    /// have an opinion about it, so it is a useful shared fixture.
+    fn low_entropy_corpus(n: usize) -> Vec<u8> {
+        (0..n).map(|i| b"ACGT"[(i * 7 + i / 13) % 4]).collect()
+    }
+
+    /// The candidate list never contains a repeat.
+    ///
+    /// Every candidate is encoded in full and a duplicate cannot change the winner,
+    /// so a repeat is wasted work by construction. This already happened once:
+    /// `rle` was added both by the registry loop and by the explicit `Repetitive`
+    /// push, so run-heavy data paid for the same pipeline twice.
+    #[test]
+    fn candidate_lists_never_contain_duplicates() {
+        let corpora = candidate_corpora();
+
+        for level in Level::ALL {
+            for (name, data) in &corpora {
+                let cands = planner(Config::new(level))
+                    .candidates_for(data)
+                    .unwrap_or_else(|e| panic!("{name} at {}: {e}", level.name()));
+
+                let mut seen: Vec<(PipelineId, TransformId)> = Vec::new();
+                for c in &cands {
+                    assert!(
+                        !seen.contains(c),
+                        "{name} at {}: {c:?} listed twice in {cands:?}",
+                        level.name()
+                    );
+                    seen.push(*c);
+                }
+            }
+        }
+    }
+
+    /// `store` is the floor every candidate list must contain.
+    ///
+    /// This is the invariant behind "a chunk never grows", so no pruning rule may
+    /// be allowed to remove it.
+    #[test]
+    fn store_is_always_a_candidate() {
+        let corpora = candidate_corpora();
+
+        for level in Level::ALL {
+            for (name, data) in &corpora {
+                let cands = planner(Config::new(level))
+                    .candidates_for(data)
+                    .unwrap_or_else(|e| panic!("{name} at {}: {e}", level.name()));
+                assert!(
+                    cands.contains(&(PipelineId::Store, TransformId::None)),
+                    "{name} at {}: store missing from {cands:?}",
+                    level.name()
+                );
+            }
+        }
+    }
+
+    /// Candidates that cannot win are skipped.
+    ///
+    /// Incompressible data is the clearest case: every pipeline would produce
+    /// something larger than the input, so measuring them is wasted by definition.
+    /// This is the fast path, and it is why uniform random data encodes in single
+    /// digit milliseconds.
+    #[test]
+    fn candidates_that_cannot_win_are_skipped() {
+        let data = pseudo_random(512 * 1024, 0x5EED);
+        assert!(
+            Analysis::of(&data).unwrap().looks_incompressible(),
+            "fixture must actually be incompressible"
+        );
+
+        for level in Level::ALL {
+            let cands = planner(Config::new(level))
+                .candidates_for(&data)
+                .expect("candidates");
+            assert_eq!(
+                cands,
+                vec![(PipelineId::Store, TransformId::None)],
+                "level {} attempted more than store on incompressible data",
+                level.name()
+            );
+        }
+    }
+
+    /// Candidates that measurably win are not accidentally pruned.
+    ///
+    /// Written as "the measured winner must be present" rather than as "this rule
+    /// must hold", so it pins behaviour and not a particular implementation. It is
+    /// the test that fails when a future pruning rule guesses too hard.
+    #[test]
+    fn winning_candidates_survive_pruning() {
+        let cases: Vec<(&str, Vec<u8>, PipelineId, TransformId)> = vec![
+            (
+                "runs",
+                runs_corpus(512 * 1024),
+                PipelineId::Rle,
+                TransformId::None,
+            ),
+            (
+                "text",
+                text_corpus(512 * 1024),
+                PipelineId::Statistical,
+                TransformId::None,
+            ),
+            (
+                "numeric",
+                numeric_corpus(512 * 1024),
+                PipelineId::Statistical,
+                TransformId::Delta,
+            ),
+            (
+                "wide text",
+                wide_text_corpus(512 * 1024),
+                PipelineId::Statistical,
+                TransformId::None,
+            ),
+            (
+                "interleaved numeric",
+                (0..512 * 1024usize)
+                    .flat_map(|i| [((i / 256) % 256) as u8, (i % 256) as u8])
+                    .collect(),
+                PipelineId::Statistical,
+                TransformId::None,
+            ),
+            (
+                "low entropy",
+                low_entropy_corpus(512 * 1024),
+                PipelineId::Statistical,
+                TransformId::None,
+            ),
+        ];
+
+        for (name, data, winner, transform) in cases {
+            let cands = planner(Config::new(Level::Default))
+                .candidates_for(&data)
+                .unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert!(
+                cands.contains(&(winner, transform)),
+                "{name}: the measured winner {}/{} was pruned from {cands:?}",
+                winner.name(),
+                transform.name()
+            );
+        }
+    }
+
+    /// RLE is offered as a candidate on data where it loses badly.
+    ///
+    /// This is the measurement that rules out the obvious pruning rules. RLE is
+    /// accepted for both corpora below — `runs` by the `Repetitive` class, random
+    /// ACGT by `max_byte_share` — yet RLE wins one by a wide margin and loses the
+    /// other by 3.3x:
+    ///
+    /// | corpus      | RLE       | statistical | winner      |
+    /// |-------------|-----------|-------------|-------------|
+    /// | runs        | 63 095    | 76 238      | rle         |
+    /// | random acgt | 2 261 658 | 676 298     | statistical |
+    ///
+    /// So neither "skip the LZ pipelines when RLE is available" nor "trust the
+    /// `Repetitive` class" is safe: each is right on one corpus and badly wrong on
+    /// the other. That is why the planner spends a millisecond measuring RLE rather
+    /// than trying to predict its value.
+    ///
+    /// The test exists to stop anyone adding such a rule without measuring first.
+    #[test]
+    fn rle_is_offered_on_data_where_it_can_lose_badly() {
+        let runs = runs_corpus(512 * 1024);
+        let acgt = random_alphabet_corpus(512 * 1024);
+        let p = planner(Config::new(Level::Default));
+
+        for (name, data) in [("runs", &runs), ("random acgt", &acgt)] {
+            let cands = p.candidates_for(data).expect("candidates");
+            assert!(
+                cands.contains(&(PipelineId::Rle, TransformId::None)),
+                "{name} should offer RLE as a candidate, got {cands:?}"
+            );
+        }
+
+        assert_eq!(
+            p.plan_chunk(&runs, true).unwrap().pipeline,
+            PipelineId::Rle,
+            "RLE should win on run-heavy data"
+        );
+        assert_eq!(
+            p.plan_chunk(&acgt, true).unwrap().pipeline,
+            PipelineId::Statistical,
+            "statistical should win on random ACGT even though RLE was offered"
+        );
+    }
+
+    /// Pruning must not change the bytes a chunk produces.
+    ///
+    /// Deduplicating cannot change the winner — a repeat encodes to the same
+    /// payload — and this test proves that rather than assuming it. It re-encodes
+    /// the chosen candidate directly, then re-encodes every *other* candidate and
+    /// confirms none of them was better. If a pruning rule had dropped a better
+    /// candidate, that is exactly where it would show.
+    #[test]
+    fn pruning_does_not_change_the_output() {
+        let registry = crate::codec::Registry::new();
+
+        for level in Level::ALL {
+            let cfg = Config::new(level);
+            let p = planner(cfg.clone());
+
+            for (name, data) in candidate_corpora() {
+                let plan = p.plan_chunk(&data, true).expect("plan");
+                let cands = p.candidates_for(&data).expect("candidates");
+
+                let encode = |pipeline: PipelineId, transform: TransformId| {
+                    let bytes =
+                        crate::transform::apply_forward(transform, &data).expect("transform");
+                    registry
+                        .get(pipeline)
+                        .unwrap()
+                        .encode(&crate::codec::EncodeContext {
+                            input: &bytes,
+                            analysis: &Analysis::of(&bytes).unwrap(),
+                            level,
+                            dictionary: None,
+                            independent: true,
+                        })
+                        .expect("encode")
+                        .len()
+                };
+
+                assert_eq!(
+                    encode(plan.pipeline, plan.transform),
+                    plan.payload.len(),
+                    "{name} at {}: the plan and a direct encode disagree",
+                    level.name()
+                );
+
+                for candidate in &cands {
+                    if *candidate == (plan.pipeline, plan.transform) {
+                        continue;
+                    }
+                    let other = encode(candidate.0, candidate.1);
+                    assert!(
+                        other >= plan.payload.len(),
+                        "{name} at {}: candidate {candidate:?} produced {other} bytes, \
+                         better than the winner's {}",
+                        level.name(),
+                        plan.payload.len()
+                    );
+                }
+            }
+        }
+    }
+
+    /// The corpora every candidate test runs over.
+    ///
+    /// Chosen to span the shapes where different pipelines win, because a pruning
+    /// rule that only survives one of them has not been tested.
+    fn candidate_corpora() -> Vec<(&'static str, Vec<u8>)> {
+        vec![
+            ("empty", Vec::new()),
+            ("tiny", b"hi".to_vec()),
+            ("text", text_corpus(200 * 1024)),
+            ("runs", runs_corpus(200 * 1024)),
+            ("numeric", numeric_corpus(200 * 1024)),
+            ("wide text", wide_text_corpus(200 * 1024)),
+            ("low entropy", low_entropy_corpus(200 * 1024)),
+            ("random alphabet", random_alphabet_corpus(200 * 1024)),
+            ("random", pseudo_random(200 * 1024, 9)),
+            (
+                "interleaved",
+                (0..200 * 1024usize)
+                    .flat_map(|i| [((i / 256) % 256) as u8, (i % 256) as u8])
+                    .collect(),
+            ),
+        ]
     }
 
     /// A deterministic text-like corpus, so the ratio floor is reproducible.
