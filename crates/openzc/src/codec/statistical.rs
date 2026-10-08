@@ -196,12 +196,79 @@ fn literal_context(lits: &[u8], i: usize) -> usize {
     }
 }
 
-/// Symbol carrying the high byte of an escaped literal-run length.
-/// Reserved for future use; kept so the escape encoding has a named constant.
-const _EXT_RESERVED: u8 = 0;
+/// Payload bits per escaped-length byte.
+///
+/// Seven, not eight: the top bit is the continuation flag, so a length of any
+/// width fits in a self-delimiting run. This is what makes the escape correct for
+/// *every* length instead of only the small ones.
+const VARINT_PAYLOAD_BITS: u32 = 7;
+/// Mask of the payload within one escaped-length byte.
+const VARINT_PAYLOAD_MASK: u8 = 0x7F;
+/// Set on an escaped-length byte that is not the last.
+const VARINT_CONTINUE: u8 = 0x80;
 
-/// Number of low-order literal-length bytes an escape carries.
-const LIT_LEN_EXT_BYTES: usize = 2;
+/// Write an escaped length as a continuation-terminated varint.
+///
+/// This replaced a fixed two-byte escape, which could only express lengths up to
+/// 65 535 while `lit_len` is a `u32`. Any literal run of 65 536 bytes or more was
+/// silently truncated on the way out, which desynchronised the range coder and
+/// made the frame *undecodable* — not merely worse, but a hard failure on a
+/// perfectly ordinary input such as 512 KiB of little-endian `u32` counters.
+///
+/// The varint is also smaller than the two bytes it replaces for the common case:
+/// a literal run of 15..=127 bytes now costs one byte instead of two, and runs of
+/// 128..=16 383 cost the same two. Only runs above 16 383 grow, and they are rare
+/// enough that the trade is strongly positive.
+fn write_varint(enc: &mut Encoder, value: u32, byte: &Model) -> Result<()> {
+    let mut rest = value;
+    loop {
+        let payload = (rest & u32::from(VARINT_PAYLOAD_MASK)) as u8;
+        rest >>= VARINT_PAYLOAD_BITS;
+        let last = rest == 0;
+        enc.encode_symbol(
+            u32::from(payload | if last { 0 } else { VARINT_CONTINUE }),
+            byte,
+        )?;
+        if last {
+            return Ok(());
+        }
+    }
+}
+
+/// Read a length written by [`write_varint`], rejecting overlong or overflowing
+/// encodings.
+///
+/// A corrupt stream must fail here rather than produce a length that later looks
+/// like a valid one: the caller already range-checks the result against the
+/// remaining chunk, but an escape that decodes to a *smaller* plausible value
+/// would slip past that check and desynchronise the stream.
+fn read_varint(dec: &mut Decoder, byte: &Model) -> Result<u32> {
+    let mut value = 0u32;
+    let mut shift = 0u32;
+    loop {
+        let raw = dec.decode_symbol(byte)?;
+        if raw > u32::from(u8::MAX) {
+            return Err(Error::CorruptSequence(
+                "escaped length byte is outside the byte range",
+            ));
+        }
+        let raw = raw as u8;
+        let payload = u32::from(raw & VARINT_PAYLOAD_MASK);
+
+        // The last byte that can contribute is the one starting at bit 28, and it
+        // may only carry the four bits that still fit in a `u32`.
+        if shift >= 32 || (shift == 28 && payload > 0x0F) {
+            return Err(Error::CorruptSequence("escaped length overflows a u32"));
+        }
+        value |= payload << shift;
+
+        if raw & VARINT_CONTINUE == 0 {
+            return Ok(value);
+        }
+        shift += VARINT_PAYLOAD_BITS;
+    }
+}
+
 /// Number of bytes an offset costs, from its magnitude.
 #[inline]
 fn offset_width(offset: u32) -> usize {
@@ -376,9 +443,7 @@ impl Codec for StatisticalCodec {
             // after the sequence symbol, so it must be emitted there.
             enc.encode_symbol(u32::from(sym), &seq_model)?;
             if let Some(v) = lit_ext {
-                for k in 0..LIT_LEN_EXT_BYTES {
-                    enc.encode_symbol((v >> (8 * k)) & 0xFF, &byte)?;
-                }
+                write_varint(&mut enc, v, &byte)?;
             }
 
             let lits = literal_slice(input, s);
@@ -452,11 +517,7 @@ impl Codec for StatisticalCodec {
             let has_match = sym & SEQ_HAS_MATCH != 0;
 
             let lit_ext = if usize::from(sym & SEQ_LIT_LEN_MASK) == SEQ_LIT_LEN_EXT {
-                let mut val = 0u32;
-                for k in 0..LIT_LEN_EXT_BYTES {
-                    val |= dec.decode_symbol(&byte)? << (8 * k);
-                }
-                Some(val)
+                Some(read_varint(&mut dec, &byte)?)
             } else {
                 None
             };
@@ -810,6 +871,133 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The escaped literal length must survive the coder for *every* value.
+    ///
+    /// This is the test the old fixed two-byte escape failed. It could only carry
+    /// 0..=65 535, so any literal run at or above 65 536 was truncated on the way
+    /// out: the decoder then read a shorter run than was written, drifted out of
+    /// step with the range coder, and the whole frame became undecodable. Not a
+    /// worse ratio — a hard failure, on ordinary input.
+    ///
+    /// The boundaries are chosen to sit either side of every width change, because
+    /// those are the values a hand-written encoder gets wrong.
+    #[test]
+    fn escaped_literal_length_survives_every_width() {
+        let byte = byte_model().expect("byte model");
+        let mut lengths: Vec<u32> = (0..=300u32).collect();
+        lengths.extend([
+            0x7F,
+            0x80,
+            0x3FFF,
+            0x4000,
+            // The value that used to break: the first length the two-byte escape
+            // could not represent.
+            65_535,
+            65_536,
+            65_537,
+            0x0100_0000,
+            0x01FF_FFFF,
+            0x0200_0000,
+            0x0FFF_FFFF,
+            u32::MAX - 1,
+            u32::MAX,
+        ]);
+        lengths.sort_unstable();
+
+        for len in lengths {
+            let mut enc = Encoder::new();
+            write_varint(&mut enc, len, &byte).expect("write varint");
+            let coded = enc.finish().expect("finish");
+            let mut dec = Decoder::new(&coded).expect("decoder");
+            let back = read_varint(&mut dec, &byte).expect("read varint");
+            assert_eq!(back, len, "literal length {len} did not survive");
+        }
+    }
+
+    /// A length escape that never terminates must be rejected, not read forever.
+    #[test]
+    fn overlong_length_escape_is_rejected() {
+        let byte = byte_model().expect("byte model");
+        let mut enc = Encoder::new();
+        // Continuation set on every byte, with no terminator anywhere.
+        for _ in 0..8 {
+            enc.encode_symbol(u32::from(VARINT_CONTINUE | 0x01), &byte)
+                .expect("encode");
+        }
+        let coded = enc.finish().expect("finish");
+        let mut dec = Decoder::new(&coded).expect("decoder");
+        assert!(
+            read_varint(&mut dec, &byte).is_err(),
+            "an unterminated escape must not decode"
+        );
+    }
+
+    /// An escape whose payload overflows a `u32` must be rejected rather than
+    /// silently wrapped into a shorter, plausible length.
+    #[test]
+    fn overflowing_length_escape_is_rejected() {
+        let byte = byte_model().expect("byte model");
+        let mut enc = Encoder::new();
+        // Five groups of seven bits is 35 bits: four too many for a u32.
+        for _ in 0..5 {
+            enc.encode_symbol(u32::from(VARINT_CONTINUE | 0x7F), &byte)
+                .expect("encode");
+        }
+        let coded = enc.finish().expect("finish");
+        let mut dec = Decoder::new(&coded).expect("decoder");
+        assert!(
+            read_varint(&mut dec, &byte).is_err(),
+            "an escape wider than u32 must not decode"
+        );
+    }
+
+    /// The whole point of the fix, end to end through the codec.
+    ///
+    /// Little-endian `u32` counters look like a counter, so the match finder finds
+    /// almost no matches in the low bytes and the literal run runs to hundreds of
+    /// kilobytes. At 512 KiB this reliably produced a frame that encoded without
+    /// complaint and then failed to decode.
+    #[test]
+    fn a_literal_run_longer_than_the_old_escape_round_trips() {
+        let data: Vec<u8> = (0..131_072u32).flat_map(|i| i.to_le_bytes()).collect();
+
+        let analysis = Analysis::of(&data).expect("analysis");
+        let payload = StatisticalCodec::new()
+            .encode(&EncodeContext {
+                input: &data,
+                analysis: &analysis,
+                level: Level::Default,
+                dictionary: None,
+                independent: true,
+            })
+            .expect("encode");
+
+        // Guard the premise: if this ever stops producing a run past the old
+        // limit, the test stops testing the fix and someone should know.
+        let mut mc = MatchContext::build(Level::Default, data.len(), data.len(), None);
+        let seqs = StatisticalCodec::new().parse(&data, mc.finder.as_mut(), data.len());
+        let longest = seqs.iter().map(|s| s.lit_len).max().unwrap_or(0);
+        assert!(
+            longest > 65_535,
+            "expected a literal run past the old two-byte limit, longest was {longest}"
+        );
+
+        let mut out = vec![0u8; data.len()];
+        StatisticalCodec::new()
+            .decode(
+                &DecodeContext {
+                    payload: &payload,
+                    content_size: data.len(),
+                    transform: TransformId::None,
+                    dictionary: None,
+                    independent: true,
+                },
+                &mut out,
+            )
+            .expect("decode");
+        assert_eq!(out, data, "round trip must be byte-identical");
     }
 
     #[test]

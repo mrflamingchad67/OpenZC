@@ -152,50 +152,101 @@ It was implemented, tested, and unreachable: `transform_for` returned `None`
 unconditionally, so the adaptive path could never select it. It is now wired up,
 behind a measurement rather than a guess.
 
-`DeltaTransform::worth_trying` measures average absolute byte-to-byte drift over an
-8 KiB sample and only offers the transform below a threshold. Every number below is
-measured on the statistical pipeline at 256 KiB:
+`DeltaTransform::worth_trying` measures average absolute byte difference over an
+8 KiB sample. The obvious version of that statistic compares *adjacent* bytes, and
+the obvious version of the obvious version uses one threshold for everything. Both
+were wrong, and the measurements said so.
 
-| data | drift | offered? | none → delta | outcome |
+Adjacent drift alone, every number measured on the statistical pipeline at 512 KiB:
+
+| data | adjacent drift | offered? | none → delta | outcome |
 |---|---|---|---|---|
-| bytes stepping by one | 2.0 | yes | 3 809 → 2 149 | **wins 1.77x** |
-| bytes stepping by three | 5.9 | yes | 3 809 → 2 149 | **wins 1.77x** |
-| random ACGT | 7.7 | yes | 84 813 → 118 942 | **loses 0.71x** |
+| bytes stepping by three | 5.9 | yes | 6 859 → 4 183 | **wins 1.64x** |
+| random ACGT | 7.7 | yes | 168 514 → 236 234 | **loses 0.71x** |
 | u64 counter | 31.9 | no | 133 263 → 206 756 | loses 0.64x |
-| f64 series | 35.6 | no | 120 328 → 190 140 | loses 0.63x |
+| u16 counter | **120.3** | no | 433 550 → 9 475 | **wins 45.8x** |
+| ordinary text | 36.2 | no | 4 259 → 4 271 | tie |
+| uniform random | 86.6 | no | 534 326 → 534 324 | tie |
 
-Two rows matter more than the wins.
+The last three rows are the interesting ones, and the `u16` row is the whole story.
 
 **The threshold is set by a loss, not a win.** A four-symbol alphabet has low drift
 by construction — any two of four symbols are usually close — yet delta makes it
-1.4x worse there, because it destroys the short repeats LZ was already exploiting.
+0.71x worse there, because it destroys the short repeats LZ was already exploiting.
 Low drift is necessary but not sufficient. The threshold is 8.0 because at 7.7 that
 case sits just above it; the original 24.0 let it through.
 
-**Byte drift is systematically wrong for interleaved numeric fields**, which is the
-actual use case. A 16-bit counter stored as `(high, low)` byte pairs has a constant
-high byte and a low byte that jumps on every increment, so drift reads **120.3** and
-the transform is refused — while delta compresses that data **45.7x better**
-(237 235 → 5 191). This is the largest ratio win delta has on any input, and the
-heuristic rejects it, because it inspects adjacent bytes and the varying bytes are
-not adjacent.
+**Adjacent drift is systematically wrong for interleaved numeric fields**, which is
+the actual use case. A 16-bit counter stored little-endian is the byte stream
+`lo0 hi0 lo1 hi1 ...`. Every *adjacent* pair straddles a field boundary and jumps,
+so drift reads **120.3** and the transform is refused — while delta compresses that
+data **45.8x better**. This is the largest ratio win delta has on any input, and
+the heuristic rejected it, because it inspects adjacent bytes and the varying bytes
+are not adjacent.
 
-That miss is recorded as one, in a test named
-`delta_misses_interleaved_little_endian_fields` that asserts the *current* (wrong)
-behaviour, so it will fail loudly when the heuristic improves rather than passing
-quietly for the wrong reason. Fixing it needs stride-aware analysis — detecting
-constant-byte positions instead of measuring drift — which is a change to the
-analysis stage, not a tweak to a threshold. It has not been done.
+## Strides, and the one shape that still misfires
 
-So delta is a real win on a narrow class of inputs, declines everything else, and
-misses the class it was most wanted for. It costs nothing when refused: the check
-is an 8 KiB scan, and the planner measures every candidate against `store`
-regardless, so a wrong answer costs ratio and a little CPU, never correctness.
+The bytes that carry the signal are *two apart*, so the fix is to measure drift at
+several strides and offer delta if any of them is low. Stride 1 stays the primary
+test and the others are purely additive, so nothing offered before stops being
+offered.
 
-The measured cost of turning it on is nil elsewhere: text, runs, and random corpora
-all produce byte-identical output, because none of them is offered the transform.
-The only dataset affected is numeric, where the ratio improves from 0.16 to
-**0.0080** (20x) at no measurable throughput cost.
+| corpus | adjacent | stride | stride drift | none → delta | outcome |
+|---|---|---|---|---|---|
+| u16 pairs | 120.3 | 2 | 1.0 | 433 550 → 9 475 | **wins 45.8x** |
+| u24 triples | 83.3 | 3 | 0.6 | 435 542 → 357 899 | wins 1.22x |
+| u32 quads | 63.8 | 4 | 0.5 | 353 497 → 465 796 | loses 0.76x |
+| xyz u16 records | 119.4 | 6 | 1.0 | 439 992 → 14 736 | **wins 29.9x** |
+| u64 octets | 31.9 | 8 | 0.2 | 133 263 → 206 756 | loses 0.64x |
+| random u16 pairs | 84.2 | — | ~85 | 534 350 → 534 350 | tie |
+| uniform random | 86.6 | — | ~86 | 534 326 → 534 324 | tie |
+| ordinary text | 36.2 | — | 26–37 | 4 259 → 4 271 | tie |
+
+The last three rows keep this honest: noise does not produce a low stride drift at
+any width, and text does not either, so the signal stays off on exactly the data
+where it would be pure cost.
+
+**The stride set is `{2, 3, 4, 6, 8}`, and each entry is there because it was
+measured.** A power-of-two set alone misses `u24` (stride 3) and three-`u16` record
+layouts (stride 6) — both ordinary shapes, and 29.9x on the latter. Scanning every
+stride instead was measured and rejected twice over. It costs 2.3x more: 24.7 us
+for this five-stride set against 56 us for a contiguous `2..=16` and 116 us for
+`2..=32`. And at `K = 64` ordinary text registers low drift at stride 40, which is
+not a measurement bug but what happens when you take a minimum over 63 noisy
+statistics: with enough candidates, some dip under any fixed threshold. A blind
+scan does not fail by being too narrow, it fails by being too permissive, and it
+fails silently.
+
+**The signal is deliberately loose, and the reason is a property of the planner.**
+It also fires on `u32` and `u64`, where delta loses. That costs nothing in ratio: the
+planner encodes every candidate and keeps the smallest, so an extra candidate can
+only find something smaller or equal. It costs one wasted encode. Paying that on
+`u32`/`u64` to catch 45.8x on `u16` and 29.9x on records is the right way round,
+because a missed candidate costs ratio permanently and a wasted one costs CPU once.
+This asymmetry — not any property of the drift statistic — is what makes it safe to
+add candidates without predicting the winner, and it is why the RLE pruning problem
+described later is hard but this was not.
+
+**The one shape that still misfires is very short-period data.** `"hello world "
+repeats every 12 bytes, so an 8 KiB sample contains only 12 distinct byte pairs per
+stride; at stride 6 those average drift 7.00, just under the 8.0 threshold, and delta
+gets offered. It loses and the planner discards it, so the cost is one wasted
+encode.
+
+The tempting fix is to lower the stride threshold to ~4, which does exclude this
+corpus, and it is the wrong fix. Genuine cases sit at 0.2–1.0 and the periodic
+four-symbol case at 2.92, so the only evidence for a threshold anywhere in the gap
+is this one synthetic sample. A threshold chosen to exclude a single 12-byte-period
+string is overfitting to that string. Realistic text does not have the problem: a
+45-byte phrase cycle measures 24–37 at every stride, and CSV rows measure 12–19.
+It is pinned by `short_period_text_can_false_positive_and_that_is_accepted`, which
+asserts both the misfire and that it stays cheap.
+
+Analysis cost, 8 KiB sample, best of 500: **4.1-24.7 us**, against 4.2 us for the
+single adjacent pass this replaces, so roughly 6x on a check that is itself ~0.001% of
+an encode. End-to-end at 512 KiB and level `default`, text encodes in 5 ms and uniform
+random in 2 ms, both unchanged in ratio, so the overhead does not show up where it
+would matter.
 
 ## Model tables: transmit counts, not frequencies
 
@@ -327,11 +378,20 @@ Uniform random data gets exactly one candidate and encodes in under 10 ms, becau
   emitted. The field and its validation rules are in place so that adding it is not
   a breaking change, but shipping a half-used field would be worse than shipping
   it whole later.
-* **Stride-aware transform selection.** Byte drift misses interleaved numeric
-  fields, which are delta's best case (45.7x on a `(high, low)` u16 array) and
-  which it therefore refuses. Detecting constant-byte positions rather than
-  measuring drift would fix it; that is work in the analysis stage, not a
-  threshold change.
+* **Stride-aware transform selection.** Done. See "Strides, and the one shape
+  that still misfires" above. The short version: drift is now measured at several
+  strides, which recovers the 45.8x `u16` win and the 29.9x three-`u16`-record
+  win that byte drift refused.
+
+  What was *not* done is the part that would have looked cleverer: separating
+  the layouts the new signal detects and loses on. It detects `u32` and `u64`
+  interleaving too, where delta loses. That is safe rather than right, and the
+  reason it is safe is worth stating plainly, because it is the load-bearing
+  argument for the whole design: **adding a candidate to the planner cannot make
+  the ratio worse.** The planner encodes every candidate and keeps the smallest,
+  so a new candidate can only find something smaller or equal. A missed candidate
+  costs ratio permanently; a wasted one costs one encode. That asymmetry is why
+  the signal is deliberately loose instead of tuned tight.
 * **A signal that predicts the RLE winner.** ~1 200 ms is spent per 2 MiB of
   run-heavy data at level `max` on candidates that provably lose, and none of it can
   be removed safely: RLE wins on one corpus and loses by 3.3x on another that looks

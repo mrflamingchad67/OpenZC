@@ -1,4 +1,4 @@
-# The OpenZC container format, version 1.0
+# The OpenZC container format, version 2.0
 
 This is the normative description of the format. It is written so that a decoder
 can be implemented from this document alone, without linking the `openzc` crate —
@@ -68,9 +68,9 @@ rejected rather than silently yielding a prefix.
 | Offset | Size | Field | Notes |
 |---|---|---|---|
 | 0 | 4 | `magic` | `1A 43 5A 4F` |
-| 4 | 1 | `version_major` | 1 for this document |
+| 4 | 1 | `version_major` | 2 for this document |
 | 5 | 1 | `version_minor` | 0 for this document |
-| 6 | 2 | `header_len` | 28 in v1.0 |
+| 6 | 2 | `header_len` | 28 |
 | 8 | 4 | `flags` | see below |
 | 12 | 4 | `chunk_size` | target uncompressed bytes per frame, > 0 |
 | 16 | 4 | `window_size` | maximum match distance, > 0, `<= chunk_size` |
@@ -300,6 +300,20 @@ symbol. Offsets are split by magnitude into a width class and low-order bytes,
 coded as extra symbols against a uniform 256-way model. The high bits of the
 class are unused; a decoder must reject a sequence symbol with any of them set.
 
+The *literal* run length escape is a varint: seven payload bits per symbol, low
+group first, with the top bit set on every symbol except the last. It must be
+read to its terminator, and it must carry the length for **every** value the
+field can describe — a fixed-width escape is not permitted, because the literal
+run length is a `u32` and a short escape silently truncates it, which
+desynchronises the range coder and makes the frame undecodable rather than merely
+larger. A decoder must reject an escape whose groups exceed a `u32`, and must
+reject one that never terminates.
+
+The *match* length escape is a single symbol and does need a bound: it is
+written as `mlen - 4`, so with `MAX_MATCH = 258` it is at most 254 and always
+fits. The offset width class is likewise exact, because an offset never exceeds
+the chunk size and so needs at most four bytes.
+
 *Literal symbols* are one per literal byte, drawn from one of 16 order-1
 contexts keyed on the previous literal's high nibble. The first literal of a run
 uses context 0.
@@ -383,6 +397,7 @@ promises bounded memory has to mean it.
 
 | Version | Change |
 |---|---|
+| 2.0 | `statistical`: the escaped literal-run length is a varint (7 payload bits per byte, top bit = continuation) instead of a fixed two bytes. The old encoding could only express lengths up to 65 535, so any literal run at or above 65 536 was truncated on the way out and the frame could not be decoded. |
 | 1.0 | Initial format: container header, frames, end marker, pipelines `store`, `lz-fast`, `statistical`, `rle`, `dictionary`; transforms `none`, `delta`. |
 
 Any change to the meaning of an existing field, or to a pipeline's payload, is a

@@ -12,7 +12,13 @@ pub const MAGIC_LEN: usize = 4;
 
 /// Format major version. A decoder must implement the major version to read a
 /// stream at all.
-pub const VERSION_MAJOR: u8 = 1;
+///
+/// 2 because the `statistical` payload changed: the escaped literal-run length
+/// went from a fixed two bytes to a varint. Streams written by 1.x are *not*
+/// decodable here, and not only for the frames that were already broken — a 1.x
+/// frame with a short literal run is perfectly valid and would now mis-decode, so
+/// this is the major-version bump the format requires rather than a silent change.
+pub const VERSION_MAJOR: u8 = 2;
 /// Format minor version. Bumped for backwards-compatible additions.
 pub const VERSION_MINOR: u8 = 0;
 
