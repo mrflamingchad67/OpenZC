@@ -103,6 +103,16 @@ fn runs_corpus(n: usize) -> Vec<u8> {
     out
 }
 
+/// Numeric data, where the delta transform is meant to earn its place.
+///
+/// Bytes walking by a constant step. A multi-byte little-endian counter would be
+/// the more obvious choice, but the byte-drift heuristic cannot see interleaved
+/// fields — see `DeltaTransform::worth_trying` — so it would measure the
+/// heuristic's blind spot rather than the transform.
+fn numeric_corpus(n: usize) -> Vec<u8> {
+    (0..n).map(|i| ((i * 3) % 256) as u8).collect()
+}
+
 fn random_corpus(n: usize) -> Vec<u8> {
     let mut s = 0x5EEDu32;
     (0..n)
@@ -184,6 +194,7 @@ fn ratio_table() {
     for (name, data) in [
         ("text", text_corpus(CORPUS)),
         ("runs", runs_corpus(CORPUS)),
+        ("numeric", numeric_corpus(CORPUS)),
         ("random", random_corpus(CORPUS)),
     ] {
         let (packed, stats) = compress_slice(&data, &config).expect("compress");
@@ -279,6 +290,7 @@ fn main() {
             bench_encode("text", &text, level);
         }
         bench_encode("runs", &runs_corpus(CORPUS), Level::Default);
+        bench_encode("numeric", &numeric_corpus(CORPUS), Level::Default);
         // The most important row in this table: incompressible input must be
         // detected and stored, so this should be the fastest encode by a wide
         // margin. If it is not, the analysis stage is not doing its job.
@@ -289,6 +301,7 @@ fn main() {
         println!("\ndecode:");
         bench_decode("text", &text_corpus(CORPUS));
         bench_decode("runs", &runs_corpus(CORPUS));
+        bench_decode("numeric", &numeric_corpus(CORPUS));
         bench_decode("random", &random_corpus(CORPUS));
     }
 

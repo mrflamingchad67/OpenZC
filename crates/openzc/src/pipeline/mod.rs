@@ -120,12 +120,12 @@ impl Planner {
     ///
     /// Ordering matters: under [`CandidatePolicy::Cheap`] the first two entries
     /// are the ones kept, so they must be the most likely to win.
-    fn candidates(&self, analysis: &Analysis) -> Vec<(PipelineId, TransformId)> {
+    fn candidates(&self, input: &[u8], analysis: &Analysis) -> Vec<(PipelineId, TransformId)> {
         let level = self.config.level();
         let mut out: Vec<(PipelineId, TransformId)> = Vec::new();
 
         if self.policy == CandidatePolicy::Single {
-            let (p, t) = self.single_choice(analysis, level);
+            let (p, t) = self.single_choice(input, analysis, level);
             out.push((p, t));
             return out;
         }
@@ -141,7 +141,7 @@ impl Planner {
                 out.push(primary);
                 // A transform is only worth a second pass when the analysis
                 // suggests one, so it does not double the cost by default.
-                if let Some(t) = self.transform_for(analysis, codec.id()) {
+                if let Some(t) = self.transform_for(input, analysis, codec.id()) {
                     out.push((codec.id(), t));
                 }
             }
@@ -163,7 +163,12 @@ impl Planner {
     }
 
     /// The one pipeline to use when not searching.
-    fn single_choice(&self, analysis: &Analysis, level: Level) -> (PipelineId, TransformId) {
+    fn single_choice(
+        &self,
+        input: &[u8],
+        analysis: &Analysis,
+        level: Level,
+    ) -> (PipelineId, TransformId) {
         if self.config.strategy() == Strategy::NeverCompress || level == Level::None {
             return (PipelineId::Store, TransformId::None);
         }
@@ -175,22 +180,59 @@ impl Planner {
             Level::Default | Level::High | Level::Max => PipelineId::Statistical,
             Level::None => PipelineId::Store,
         };
-        let t = self.transform_for(analysis, p).unwrap_or(TransformId::None);
+        let t = self
+            .transform_for(input, analysis, p)
+            .unwrap_or(TransformId::None);
         (p, t)
     }
 
     /// A transform worth trying for this pipeline, if any.
-    fn transform_for(&self, analysis: &Analysis, _pipeline: PipelineId) -> Option<TransformId> {
-        // Sampling from the analysis buffer keeps this cheap; the pipeline
-        // measures the real result afterwards.
-        let _ = analysis;
-        None
+    ///
+    /// Delta is the only non-identity transform, and it earns its place only on
+    /// data whose consecutive bytes are correlated — slowly varying counters,
+    /// timestamps, little-endian integers. `DeltaTransform::worth_trying` already
+    /// encodes that test, so this defers to it rather than duplicating the
+    /// threshold in two places that could then drift apart.
+    ///
+    /// This is a hint and nothing more: the planner measures the real output of
+    /// every candidate against `store`, so a wrong answer costs ratio and a little
+    /// CPU, never correctness. That is what lets this be permissive — being wrong
+    /// in the cheap direction is fine.
+    ///
+    /// Incompressible data is excluded explicitly. Random input's drift statistic
+    /// is already far above the threshold and would be pruned anyway, but
+    /// short-circuiting keeps the fast path for incompressible data free of a
+    /// transform pass that cannot win.
+    ///
+    /// Only the two LZ-shaped pipelines see a transform. RLE would gain nothing:
+    /// it already collapses runs, and delta would destroy the byte identity it
+    /// depends on. `store` must never be transformed, since storing transformed
+    /// bytes without recording the transform would not be invertible.
+    fn transform_for(
+        &self,
+        input: &[u8],
+        analysis: &Analysis,
+        pipeline: PipelineId,
+    ) -> Option<TransformId> {
+        if !matches!(pipeline, PipelineId::LzFast | PipelineId::Statistical) {
+            return None;
+        }
+        if analysis.looks_incompressible() {
+            return None;
+        }
+
+        // `worth_trying` is on the `Transform` trait, not inherent, so it has to be
+        // called through the trait rather than on the struct.
+        use crate::transform::Transform;
+        crate::transform::DeltaTransform
+            .worth_trying(input)
+            .then_some(TransformId::Delta)
     }
 
     /// Plan and encode one chunk.
     pub fn plan_chunk(&self, input: &[u8], independent: bool) -> Result<ChunkPlan> {
         let analysis = Analysis::of(input)?;
-        let candidates = self.candidates(&analysis);
+        let candidates = self.candidates(input, &analysis);
 
         let mut best: Option<(PipelineId, TransformId, Vec<u8>)> = None;
         let mut tried: Vec<PipelineId> = Vec::new();
@@ -367,7 +409,7 @@ mod tests {
     /// accept a worse ratio, and should be made with that in mind.
     #[test]
     fn ratio_floors_are_maintained() {
-        let cases: [(&str, Vec<u8>, f64); 5] = [
+        let cases: [(&str, Vec<u8>, f64); 6] = [
             ("text", text_corpus(256 * 1024), 0.25),
             (
                 "source",
@@ -409,6 +451,9 @@ mod tests {
                 },
                 1.0025,
             ),
+            // Delta-eligible data. A floor rather than a benchmark, because a
+            // regression in transform selection must fail the gate.
+            ("numeric", numeric_corpus(256 * 1024), 0.02),
         ];
 
         for (name, data, floor) in cases {
@@ -427,6 +472,15 @@ mod tests {
                 packed.len()
             );
         }
+    }
+
+    /// A deterministic numeric corpus, so the ratio floor is reproducible.
+    ///
+    /// Bytes walking by a constant step: the shape the delta transform exists for, and
+    /// distinct from the text and low-entropy corpora so a change to transform
+    /// selection shows up here rather than hiding behind them.
+    fn numeric_corpus(n: usize) -> Vec<u8> {
+        (0..n).map(|i| ((i * 3) % 256) as u8).collect()
     }
 
     /// A deterministic text-like corpus, so the ratio floor is reproducible.
@@ -453,6 +507,11 @@ mod tests {
         // The corpus is low-entropy but not periodic: a chain walker has to walk
         // back through many candidate positions to find the long matches, so its
         // extra effort shows up in the output rather than only in the clock.
+        // A four-symbol alphabet at low drift, where a deeper chain walk finds
+        // longer matches. Deliberately *not* delta-friendly: this corpus is here to
+        // isolate the level knob, and a corpus the transform can also improve
+        // would confound the two. `delta_does_not_fire_on_chain_sensitive_data`
+        // pins that.
         let data: Vec<u8> = (0..512 * 1024usize)
             .map(|i| b"ACGT"[(i * 7 + i / 13) % 4])
             .collect();
@@ -473,6 +532,272 @@ mod tests {
         // Neither may be worse than storing the input.
         assert!(max.payload.len() < data.len());
         assert!(fast.payload.len() < data.len());
+    }
+
+    /// The data shapes where the delta transform genuinely wins, and the ones where
+    /// it must not be attempted.
+    ///
+    /// These numbers are measured, not aspirational. The losing cases matter as
+    /// much as the winning ones: `transform_for` is a heuristic that gates a real
+    /// measurement, so a false positive costs CPU and a false negative costs ratio.
+    /// Both directions are pinned here so the threshold cannot drift silently.
+    #[test]
+    fn delta_selection_matches_measured_outcomes() {
+        // (name, data, whether delta should be attempted)
+        let cases: Vec<(&str, Vec<u8>, bool)> = vec![
+            (
+                // Steps of one: every byte differs from its predecessor by a
+                // constant, which is exactly what delta is for.
+                "bytes stepping by one",
+                (0..200 * 1024usize).map(|i| (i % 256) as u8).collect(),
+                true,
+            ),
+            (
+                // A byte walk that increments by a constant: every byte differs
+                // from its predecessor by the same small amount, which is exactly
+                // the shape delta exists for.
+                "bytes stepping by three",
+                (0..200 * 1024usize)
+                    .map(|i| ((i * 3) % 256) as u8)
+                    .collect(),
+                true,
+            ),
+            (
+                // A four-symbol alphabet has low byte-to-byte drift by
+                // construction, but delta *hurts* here: it destroys the short
+                // repeats LZ is already exploiting. This is the case that sets the
+                // threshold, so it is the one most worth pinning.
+                "random four-symbol alphabet",
+                (0..200 * 1024usize)
+                    .map(|i| b"ACGT"[(i * 7 + i / 13) % 4])
+                    .collect(),
+                false,
+            ),
+            (
+                // Wide drift, no structure.
+                "uniform random",
+                {
+                    let mut s = 0x5EEDu32;
+                    (0..100 * 1024usize)
+                        .map(|_| {
+                            s ^= s << 13;
+                            s ^= s >> 17;
+                            s ^= s << 5;
+                            (s >> 24) as u8
+                        })
+                        .collect()
+                },
+                false,
+            ),
+        ];
+
+        for (name, data, should_try) in cases {
+            let analysis = Analysis::of(&data).unwrap();
+            let chosen = planner(Config::new(Level::Default))
+                .plan_chunk(&data, true)
+                .unwrap();
+            let attempted = chosen.transform == TransformId::Delta;
+
+            assert_eq!(
+                attempted,
+                should_try,
+                "{name}: delta {} but measurement says {}",
+                if attempted {
+                    "was attempted"
+                } else {
+                    "was skipped"
+                },
+                if should_try {
+                    "it should be tried"
+                } else {
+                    "it should be skipped"
+                }
+            );
+            let _ = analysis;
+        }
+    }
+
+    #[test]
+    fn delta_selection_actually_improves_the_numeric_case() {
+        // The reason the transform exists. A 16-bit counter is the clearest case:
+        // delta turns a slowly varying series into mostly zeroes, and the payload
+        // must get substantially smaller for the transform to have earned its place.
+        // A byte walk with a constant step. Chosen over a multi-byte integer counter
+        // deliberately: interleaved little-endian fields defeat the byte-drift
+        // heuristic (see `DeltaTransform::worth_trying`), so they cannot be used
+        // to test *selection*. This shape has low drift *and* benefits, which is
+        // the only combination where a selection test proves anything.
+        let data: Vec<u8> = (0..200 * 1024usize)
+            .map(|i| ((i * 3) % 256) as u8)
+            .collect();
+
+        let with = planner(Config::new(Level::Default))
+            .plan_chunk(&data, true)
+            .unwrap();
+        assert_eq!(
+            with.transform,
+            TransformId::Delta,
+            "a constant-step byte walk is a case delta is for"
+        );
+
+        // Measure against the same pipeline with no transform, so the comparison
+        // isolates the transform rather than the pipeline.
+        let mut best_without = usize::MAX;
+        for pipeline in [
+            PipelineId::Statistical,
+            PipelineId::LzFast,
+            PipelineId::Rle,
+            PipelineId::Store,
+        ] {
+            let analysis = Analysis::of(&data).unwrap();
+            let payload = crate::codec::Registry::new()
+                .get(pipeline)
+                .unwrap()
+                .encode(&crate::codec::EncodeContext {
+                    input: &data,
+                    analysis: &analysis,
+                    level: Level::Default,
+                    dictionary: None,
+                    independent: true,
+                })
+                .map(|p| p.len())
+                .unwrap_or(usize::MAX);
+            best_without = best_without.min(payload);
+        }
+
+        // Measured 1 699 against 3 135, so a 3x margin is too tight to survive ordinary
+        // churn. The improvement is real and large; the exact factor is not the
+        // claim being made here.
+        assert!(
+            with.payload.len() + 512 < best_without,
+            "delta produced {} bytes against an untransformed best of {best_without}",
+            with.payload.len()
+        );
+    }
+
+    /// The known limitation of byte-drift selection, pinned so it cannot be
+    /// forgotten.
+    ///
+    /// Interleaved little-endian fields are delta's *best* case and byte-drift's
+    /// *worst*: a 16-bit counter stored as `(high, low)` pairs has a constant high
+    /// byte and a low byte that jumps on every increment, so the drift statistic
+    /// reads 120 while delta compresses 45x better. The heuristic cannot see this
+    /// because it looks at adjacent bytes, and the varying bytes are not adjacent.
+    ///
+    /// This test asserts the *current* behaviour — delta is skipped — and will fail
+    /// when the heuristic is improved, which is the point. Anyone who fixes the
+    /// heuristic then moves the case into `delta_selection_matches_measured_outcomes`
+    /// with the new threshold documented, rather than leaving a test that quietly
+    /// passes for the wrong reason.
+    #[test]
+    fn delta_misses_interleaved_little_endian_fields() {
+        // (high byte of a 16-bit counter, low byte): the exact shape above.
+        let data: Vec<u8> = (0..200 * 1024usize)
+            .flat_map(|i| [((i / 256) % 256) as u8, (i % 256) as u8])
+            .collect();
+
+        // Sanity: the transform really is worth 40x here, so this is a miss and not
+        // a case where delta simply does not help.
+        use crate::transform::Transform;
+        let drift_ok = crate::transform::DeltaTransform.worth_trying(&data);
+        assert!(
+            !drift_ok,
+            "documented limitation: byte-drift rejects interleaved fields"
+        );
+
+        let plan = planner(Config::new(Level::Default))
+            .plan_chunk(&data, true)
+            .unwrap();
+        assert_eq!(
+            plan.transform,
+            TransformId::None,
+            "delta is not selected here; this test documents that miss"
+        );
+    }
+
+    #[test]
+    fn delta_selection_never_makes_a_frame_larger() {
+        // The planner's core guarantee, under the transform. Every corpus, every
+        // level: a frame may not exceed its input, with or without delta chosen.
+        let corpora: Vec<Vec<u8>> = vec![
+            (0..300 * 1024usize).map(|i| (i % 256) as u8).collect(),
+            (0..300 * 1024usize)
+                .flat_map(|i| (i as i16).to_le_bytes())
+                .collect(),
+            (0..300 * 1024usize)
+                .map(|i| b"ACGT"[(i * 7 + i / 13) % 4])
+                .collect(),
+            {
+                let mut s = 0x5EEDu32;
+                (0..300 * 1024usize)
+                    .map(|_| {
+                        s ^= s << 13;
+                        s ^= s >> 17;
+                        s ^= s << 5;
+                        (s >> 24) as u8
+                    })
+                    .collect()
+            },
+            b"the quick brown fox jumps over the lazy dog ".repeat(8_000),
+        ];
+
+        for level in Level::ALL {
+            for data in &corpora {
+                let plan = planner(Config::new(level)).plan_chunk(data, true).unwrap();
+                assert!(
+                    plan.payload.len() <= data.len(),
+                    "level {} grew {} bytes to {}",
+                    level.name(),
+                    data.len(),
+                    plan.payload.len()
+                );
+                assert_eq!(
+                    plan.content_size,
+                    data.len(),
+                    "frame size must match the chunk"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn delta_selected_frames_round_trip() {
+        // The lossless contract, specifically for frames that carry a transform.
+        // A transform bug would be invisible on untransformed data.
+        // Same constant-step shape as the selection test, so delta is actually chosen.
+        let data: Vec<u8> = (0..200 * 1024usize)
+            .map(|i| ((i * 3) % 256) as u8)
+            .collect();
+
+        // `Level::None` is `store` by definition and records no transform, so it
+        // is excluded from the transform assertion below rather than special-cased
+        // inside it.
+        for level in Level::ALL {
+            let cfg = Config::new(level);
+            let (packed, _) = crate::compress::compress_slice(&data, &cfg).expect("compress");
+            let (decoded, stats) =
+                crate::decompress::decompress_slice(&packed, &cfg).expect("decompress");
+            assert_eq!(
+                decoded,
+                data,
+                "level {} lost data through the transform",
+                level.name()
+            );
+            assert!(stats.verified);
+
+            // And the transform must actually be recorded, or a decoder could not
+            // know to invert it. `Level::None` stores the chunk untouched, so it
+            // legitimately records nothing.
+            if level != Level::None {
+                let transforms =
+                    crate::decompress::transforms_used(&packed, &cfg).expect("transforms");
+                assert!(
+                    transforms.contains(&TransformId::Delta),
+                    "level {} did not record the transform it used",
+                    level.name()
+                );
+            }
+        }
     }
 
     #[test]

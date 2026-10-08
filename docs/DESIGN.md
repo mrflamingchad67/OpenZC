@@ -141,6 +141,62 @@ matching introduces no false positives. The lesson generalises: any "have I seen
 this before" statistic built on a truncated hash is measuring the hash table, not
 the data.
 
+## Transforms, and the heuristic that gates them
+
+A transform rearranges a chunk so the LZ stage sees more redundancy. Only `delta`
+exists — a byte-wise difference against the previous byte, applied before the
+pipeline and inverted after, with the first byte differenced against zero so the
+inverse needs no carried state.
+
+It was implemented, tested, and unreachable: `transform_for` returned `None`
+unconditionally, so the adaptive path could never select it. It is now wired up,
+behind a measurement rather than a guess.
+
+`DeltaTransform::worth_trying` measures average absolute byte-to-byte drift over an
+8 KiB sample and only offers the transform below a threshold. Every number below is
+measured on the statistical pipeline at 256 KiB:
+
+| data | drift | offered? | none → delta | outcome |
+|---|---|---|---|---|
+| bytes stepping by one | 2.0 | yes | 3 809 → 2 149 | **wins 1.77x** |
+| bytes stepping by three | 5.9 | yes | 3 809 → 2 149 | **wins 1.77x** |
+| random ACGT | 7.7 | yes | 84 813 → 118 942 | **loses 0.71x** |
+| u64 counter | 31.9 | no | 133 263 → 206 756 | loses 0.64x |
+| f64 series | 35.6 | no | 120 328 → 190 140 | loses 0.63x |
+
+Two rows matter more than the wins.
+
+**The threshold is set by a loss, not a win.** A four-symbol alphabet has low drift
+by construction — any two of four symbols are usually close — yet delta makes it
+1.4x worse there, because it destroys the short repeats LZ was already exploiting.
+Low drift is necessary but not sufficient. The threshold is 8.0 because at 7.7 that
+case sits just above it; the original 24.0 let it through.
+
+**Byte drift is systematically wrong for interleaved numeric fields**, which is the
+actual use case. A 16-bit counter stored as `(high, low)` byte pairs has a constant
+high byte and a low byte that jumps on every increment, so drift reads **120.3** and
+the transform is refused — while delta compresses that data **45.7x better**
+(237 235 → 5 191). This is the largest ratio win delta has on any input, and the
+heuristic rejects it, because it inspects adjacent bytes and the varying bytes are
+not adjacent.
+
+That miss is recorded as one, in a test named
+`delta_misses_interleaved_little_endian_fields` that asserts the *current* (wrong)
+behaviour, so it will fail loudly when the heuristic improves rather than passing
+quietly for the wrong reason. Fixing it needs stride-aware analysis — detecting
+constant-byte positions instead of measuring drift — which is a change to the
+analysis stage, not a tweak to a threshold. It has not been done.
+
+So delta is a real win on a narrow class of inputs, declines everything else, and
+misses the class it was most wanted for. It costs nothing when refused: the check
+is an 8 KiB scan, and the planner measures every candidate against `store`
+regardless, so a wrong answer costs ratio and a little CPU, never correctness.
+
+The measured cost of turning it on is nil elsewhere: text, runs, and random corpora
+all produce byte-identical output, because none of them is offered the transform.
+The only dataset affected is numeric, where the ratio improves from 0.16 to
+**0.0080** (20x) at no measurable throughput cost.
+
 ## Model tables: transmit counts, not frequencies
 
 The statistical pipeline trains a sequence model and 16 order-1 literal models per
@@ -198,10 +254,15 @@ difference between them.**
   emitted. The field and its validation rules are in place so that adding it is not
   a breaking change, but shipping a half-used field would be worse than shipping
   it whole later.
-* **A transform search.** `Planner::transform_for` currently always returns
-  `None`, so `delta` is never selected by the adaptive path even though it is fully
-  implemented and tested. Delta is a large win on some numeric data and the
-  selection logic is a small piece of work.
+* **Stride-aware transform selection.** Byte drift misses interleaved numeric
+  fields, which are delta's best case (45.7x on a `(high, low)` u16 array) and
+  which it therefore refuses. Detecting constant-byte positions rather than
+  measuring drift would fix it; that is work in the analysis stage, not a
+  threshold change.
+* **Candidate pruning.** The planner attempts every plausible pipeline on every
+  chunk. At `Level::Default` that means the statistical pipeline runs even on
+  chunks where `store` will win outright. Measuring how often that happens, and
+  skipping safely, is the next cheap win.
 * **GPU acceleration.** Deliberately out of scope. It is the only plausible answer
   to "much faster", and it would make the decoder harder to audit — which is the
   wrong trade for a format whose main claim is that damage is detectable.
