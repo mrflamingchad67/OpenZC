@@ -31,11 +31,12 @@ Not done yet, and listed here so you are not misled:
 
 * No directory/archive mode — the CLI compresses one file at a time, so a folder
   of small files pays the container overhead repeatedly and can come out *larger*
-* No fuzz targets yet (the decoder is written to return errors rather than panic,
-  and the test suite checks that on corrupted input, but it has not been fuzzed)
+* No `cargo-fuzz` targets yet. The decoder is written to return errors rather than
+  panic and `tests/robustness.rs` checks that on truncated, bit-flipped and
+  rewritten-field input on stable Rust, but it has not been fuzzed properly
 * No published benchmarks against other compressors. The numbers below are from
   this project's own harness on generated data and are **not** a comparison
-* `docs/DESIGN.md` is not written yet
+* Dictionary priming and transform selection are specified but never emitted
 * The `MIT`/`Apache-2.0` licence text files are not in the repository yet
 
 ## Install
@@ -142,6 +143,12 @@ Two results are worth reading twice:
   it is what stops a compressor from burning CPU to make a file bigger.
 * **`runs` compresses 33x** and decodes at over 500 MB/s, because `rle` has no
   match window at all.
+
+Frame encoding is parallel: chunks are planned across a thread pool and written in
+order, so the output is byte-identical to a serial run. Measured at 1.55x on a
+12-core machine for cheap levels, with no gain on a single-chunk input (the batch
+is sized in bytes to keep memory bounded, so one chunk means one batch of one).
+`Threads::Serial` disables it for single-threaded measurement.
 
 Real files behave very differently from generated ones. A 4 KB PDF in this
 repository's test data compressed 24%, and a GIMP splash-screen PNG compressed

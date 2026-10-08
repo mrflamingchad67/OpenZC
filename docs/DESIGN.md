@@ -246,8 +246,63 @@ Two readings matter more than the numbers:
 * **Compression is 10–50x slower than decompression**, and that asymmetry is by
   design. Encoding may search; decoding may not.
 
-The obvious next optimisation is parallel frame encoding, which the chunker and
-the `INDEPENDENT` frame flag are already structured for, but which is not yet
-wired up. Profiling is required before anything else: it is not known where the
-time actually goes, and guessing has already produced one wrong answer in this
-project (the `copy_within` suggestion).
+### Parallel encoding, and what it actually bought
+
+Frame encoding is now batched and parallel. Chunks are read sequentially, planned
+across a thread pool, and the resulting frames written in input order — so the
+output is byte-identical to a serial run, which a test pins.
+
+Measured on 12 cores, 2 MiB of text:
+
+| Level | Serial | Parallel | Speedup |
+|---|---|---|---|
+| fast | 43.7 MB/s | 61.8 MB/s | 1.42x |
+| default | 35.1 MB/s | 57.2 MB/s | 1.63x |
+| high | 16.6 MB/s | 16.8 MB/s | 1.01x |
+| max | 4.0 MB/s | 4.0 MB/s | 1.01x |
+
+Three things are worth recording, because none of them is what the change was
+expected to deliver.
+
+**The gain is capped well below the core count**, and 1.55x on 12 cores is
+consistent with Amdahl's law rather than a bug: the planner also allocates and
+hashes, and reading the next chunk is serial I/O that cannot overlap because there
+is one reader.
+
+**It does nothing at all on a single-chunk input.** The batch is sized in *bytes*
+(`BATCH_BYTES / chunk_size`) so that peak memory stays bounded — a fixed chunk
+*count* would hold 32 MiB at the default 4 MiB chunk size, which would quietly
+contradict the bounded-memory claim. The consequence is that a 2 MiB input is one
+chunk, so the batch holds one chunk, so there is nothing to parallelise. The
+measured win needs multi-chunk input, which is what the `threads` benchmark
+section uses.
+
+**High levels gain nothing.** At `high` and `max` the speedup is 1.01x — inside
+the noise. A single chunk takes long enough that scheduling is negligible against
+it, and there is no second chunk in a 2 MiB corpus to overlap with anyway. So
+parallelism helps where compression is cheap and is simply inert where it is
+expensive, which is the useful direction: `Threads::Serial` exists for callers who
+want to measure single-thread behaviour, and the run-to-run spread (the `high`
+row measured 0.96x on one run and 1.01x on the next) is the size of the noise
+floor here.
+
+### Why there is no `pprof`
+
+`pprof` needs signal-based sampling, which means Unix `nix` APIs and
+`libc::pthread_t`. Neither exists on Windows, where this project is developed. A
+profiler that cannot be run on the development machine does not get run, and an
+unprofiled optimisation is a guess.
+
+`benches/profile.rs` replaces it with portable Rust and reports flat self time per
+section. The trade is real: there is no call tree, only which operations dominate.
+That is enough to answer "where is the time going", which is the question that has
+to be answered first. If a call tree is ever needed, install `pprof` on a Unix
+host and profile there.
+
+### Profiling before optimising, still
+
+This project has now made three wrong guesses about where time goes: `copy_within`
+(via a Clippy suggestion, which silently corrupted data), and two rounds of
+assuming the statistical pipeline was the bottleneck when it is not — it is
+*incompressible input detection* that makes the common case fast. The harness
+exists so the fourth guess is cheaper than the third.

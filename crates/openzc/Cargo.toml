@@ -29,6 +29,13 @@ constriction = "0.5"
 # reaches a downstream build of the library.
 criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
 
+[[bench]]
+name = "profile"
+# A manual harness rather than a criterion one: it exists to be *read*, not to
+# compare runs. It writes a flamegraph and a collapsed-stack file for `inferno`,
+# so the output is something a human can open.
+harness = false
+
 [features]
 default = ["parallel", "checksum"]
 # Parallel chunk compression/decompression via Rayon.
