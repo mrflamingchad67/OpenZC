@@ -23,6 +23,12 @@ rayon = { version = "1.12", optional = true }
 # the context model, the pipeline selection — is OpenZC's own.
 constriction = "0.5"
 
+[dev-dependencies]
+# Statistical benchmarking, so a change can be compared against the last run
+# rather than against a number someone remembered. Dev-only: criterion never
+# reaches a downstream build of the library.
+criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
+
 [features]
 default = ["parallel", "checksum"]
 # Parallel chunk compression/decompression via Rayon.

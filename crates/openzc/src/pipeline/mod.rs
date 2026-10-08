@@ -355,6 +355,95 @@ mod tests {
         assert_ne!(plan.pipeline, PipelineId::Store);
     }
 
+    /// Ratio floors for each data shape.
+    ///
+    /// This is the guard against "optimised" changes that quietly lose ratio. A
+    /// speed benchmark would happily report a 20% throughput win for a change
+    /// that made every file 5% bigger, so the ratio is asserted here where it
+    /// fails the quality gate.
+    ///
+    /// The floors sit a few percent below what the engine achieves today, so
+    /// ordinary churn does not trip them. Raising one is a deliberate decision to
+    /// accept a worse ratio, and should be made with that in mind.
+    #[test]
+    fn ratio_floors_are_maintained() {
+        let cases: [(&str, Vec<u8>, f64); 5] = [
+            ("text", text_corpus(256 * 1024), 0.25),
+            (
+                "source",
+                (0..3000usize)
+                    .flat_map(|i| {
+                        format!("    let value_{i} = compute(&self, {i})?;\n").into_bytes()
+                    })
+                    .collect(),
+                0.20,
+            ),
+            (
+                "runs",
+                (0..256 * 1024usize).map(|i| (i / 97) as u8).collect(),
+                0.10,
+            ),
+            (
+                "low entropy",
+                (0..256 * 1024usize)
+                    .map(|i| b"ACGT"[(i * 7 + i / 13) % 4])
+                    .collect(),
+                0.22,
+            ),
+            (
+                // Incompressible input must cost framing overhead and nothing
+                // else: a 28-byte header, a 16-byte frame header, two 32-byte
+                // hashes and a 12-byte end marker, which is 120 bytes however
+                // much data follows. Expressed as a ratio over a 64 KiB chunk.
+                "incompressible",
+                {
+                    let mut s = 0x5EEDu32;
+                    (0..64 * 1024usize)
+                        .map(|_| {
+                            s ^= s << 13;
+                            s ^= s >> 17;
+                            s ^= s << 5;
+                            (s >> 24) as u8
+                        })
+                        .collect()
+                },
+                1.0025,
+            ),
+        ];
+
+        for (name, data, floor) in cases {
+            let config = Config::new(Level::Default);
+            let (packed, _) = crate::compress::compress_slice(&data, &config).unwrap();
+            let ratio = packed.len() as f64 / data.len() as f64;
+
+            // The floor already encodes the expectation for each shape; the
+            // incompressible case's floor is the framing overhead, not a ratio
+            // below one, so there is nothing special to do here. Keeping one
+            // uniform rule means a case cannot silently bypass its own bound.
+            assert!(
+                ratio <= floor,
+                "{name}: ratio {ratio:.4} exceeded the floor {floor:.4} ({} -> {} bytes)",
+                data.len(),
+                packed.len()
+            );
+        }
+    }
+
+    /// A deterministic text-like corpus, so the ratio floor is reproducible.
+    fn text_corpus(n: usize) -> Vec<u8> {
+        const WORDS: [&str; 8] = [
+            "the ", "quick ", "brown ", "fox ", "jumps ", "over ", "lazy ", "dog ",
+        ];
+        let mut out = Vec::with_capacity(n + 32);
+        let mut i = 0usize;
+        while out.len() < n {
+            out.extend_from_slice(WORDS[i % WORDS.len()].as_bytes());
+            i += 1;
+        }
+        out.truncate(n);
+        out
+    }
+
     #[test]
     fn level_controls_search_effort() {
         // The level has to reach the match finder, not stop at the config. If it

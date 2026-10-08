@@ -395,6 +395,22 @@ impl<R: Read> StreamReader<R> {
             ));
         }
 
+        // A conforming encoder never emits a payload larger than the content it
+        // decodes to: `store` is the floor, and a pipeline is only kept when it
+        // beat `store`. So `payload_size > content_size` is corruption, and it
+        // must be caught here rather than discovered three lines below.
+        //
+        // Checking it before the allocation is what makes this a security check
+        // and not a tidiness one: a corrupt length of 4 GiB would otherwise ask
+        // for a 4 GiB buffer before failing, and would then be *misreported* as a
+        // truncated stream, sending whoever is diagnosing the file down the wrong
+        // path entirely.
+        if header.payload_size > header.content_size {
+            return Err(Error::CorruptChunk(
+                "frame payload is larger than the content it decodes to",
+            ));
+        }
+
         let mut payload = vec![0u8; header.payload_size as usize];
         read_exact(&mut self.inner, &mut payload)?;
 
@@ -662,6 +678,56 @@ mod tests {
             StreamReader::new(SliceReader::new(&data), &cfg()),
             Err(Error::UnexpectedEof { .. })
         ));
+    }
+
+    #[test]
+    fn corrupt_frame_length_is_reported_as_corruption_not_truncation() {
+        // A damaged length field must be diagnosed as corruption. Reporting it as
+        // a truncated stream would send whoever is repairing the file looking for
+        // a cut-off download, and the two have nothing in common.
+        let mut out = Vec::new();
+        {
+            let mut w = StreamWriter::new(&mut out, &cfg()).unwrap();
+            w.write_chunk(b"some data here, long enough to compress a little")
+                .unwrap();
+            w.finish().unwrap();
+        }
+
+        let header_len = ContainerHeader::encoded_len();
+        // payload_size sits at offset 12 of the frame header, which itself starts
+        // immediately after the container header.
+        let payload_size_at = header_len + FRAME_HEADER_LEN - 4;
+        let mut damaged = out.clone();
+        damaged[payload_size_at..payload_size_at + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+
+        let mut r = StreamReader::new(SliceReader::new(&damaged), &cfg()).unwrap();
+        assert!(
+            matches!(r.next_frame(), Err(Error::CorruptChunk(_))),
+            "expected corruption, got {:?}",
+            r.next_frame().err()
+        );
+    }
+
+    #[test]
+    fn oversized_frame_length_does_not_attempt_the_allocation() {
+        // The same check is a memory-safety property: a length of 4 GiB must be
+        // rejected before the buffer is reserved, not after.
+        let mut out = Vec::new();
+        {
+            let mut w = StreamWriter::new(&mut out, &cfg()).unwrap();
+            w.write_chunk(b"payload").unwrap();
+            w.finish().unwrap();
+        }
+        let header_len = ContainerHeader::encoded_len();
+        let payload_size_at = header_len + FRAME_HEADER_LEN - 4;
+        let mut damaged = out.clone();
+        damaged[payload_size_at..payload_size_at + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+
+        // If this tried to allocate 4 GiB it would be obvious; succeeding quickly
+        // with a clean error is the point.
+        let mut r = StreamReader::new(SliceReader::new(&damaged), &cfg()).unwrap();
+        let err = r.next_frame().expect_err("must reject");
+        assert!(matches!(err, Error::CorruptChunk(_)), "got {err:?}");
     }
 
     #[test]
